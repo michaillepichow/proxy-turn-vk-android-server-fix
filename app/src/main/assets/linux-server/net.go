@@ -391,6 +391,9 @@ PersistentKeepalive = %d`,
 }
 
 func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgDev *device.Device, keys *wgKeys) {
+	// 1. предотвсращаем утечку тута
+	defer clientConn.Close()
+
 	atomic.AddInt64(&totalConns, 1)
 
 	var connPassword string
@@ -398,13 +401,13 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 	dtlsConn, ok := clientConn.(*dtls.Conn)
 	if !ok {
-		return
+		return // Ранее сокет оставался открытым, теперь закроется благодаря defer
 	}
 
 	hctx, hcancel := context.WithTimeout(ctx, 30*time.Second)
 	if err := dtlsConn.HandshakeContext(hctx); err != nil {
 		hcancel()
-		return
+		return // Ранее сокет оставался открытым, теперь закроется благодаря defer
 	}
 	hcancel()
 
@@ -538,13 +541,10 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		wgConn.SetDeadline(time.Now())
 	})
 
-	// Локальные счетчики трафика для текущей сессии
 	var localUpBytes int64
 	var localDownBytes int64
 
-	// Функция сброса локальной статистики в глобальную БД
 	flushStats := func() bool {
-		// Атомарно забираем накопленные байты и сбрасываем локальные счетчики в 0
 		up := atomic.SwapInt64(&localUpBytes, 0)
 		down := atomic.SwapInt64(&localDownBytes, 0)
 
@@ -553,7 +553,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 		e, ok := db.Passwords[connPassword]
 		if !ok || e == nil || isPasswordExpired(e) || e.IsDeactivated {
-			// Если пароль больше не валиден (истек/удален), сигнализируем о необходимости закрыть соединение
 			return false
 		}
 
@@ -565,22 +564,19 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	var proxyWg sync.WaitGroup
 	proxyWg.Add(2)
 
-	// Запускаем горутину периодического сброса статистики, только если это не мастер-пароль
 	if connPassword != "" && !connIsMainPass {
 		proxyWg.Add(1)
 		go func() {
 			defer proxyWg.Done()
-			ticker := time.NewTicker(5 * time.Second) // Интервал обновления базы данных
+			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-pctx.Done():
-					// Перед выходом осуществляем финальный сброс оставшейся статистики
 					flushStats()
 					return
 				case <-ticker.C:
-					// Сбрасываем статистику. Если сессия невалидна, инициируем отключение
 					if !flushStats() {
 						pcancel()
 						return
@@ -613,7 +609,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 			atomic.AddInt64(&totalBytesFromClient, int64(nn))
 			
-			// Локальный атомарный инкремент без использования мьютекса
 			if connPassword != "" && !connIsMainPass {
 				atomic.AddInt64(&localUpBytes, int64(nn))
 			}
@@ -649,7 +644,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 			atomic.AddInt64(&totalBytesToClient, int64(nn))
 			
-			// Локальный атомарный инкремент без использования мьютекса
 			if connPassword != "" && !connIsMainPass {
 				atomic.AddInt64(&localDownBytes, int64(nn))
 			}
