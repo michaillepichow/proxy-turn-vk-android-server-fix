@@ -57,11 +57,9 @@ type ObfsConfig struct {
 }
 
 type ObfsState struct {
-	mu      sync.Mutex
 	initSeq uint16
 	initTs  uint32
-	count   uint64
-	rng     uint64 // Быстрый неблокирующий PRNG (Xorshift64)
+	count   uint64 // Поле обновляется атомарно через sync/atomic
 }
 
 func NewObfsConfig() *ObfsConfig {
@@ -75,19 +73,12 @@ func NewObfsConfig() *ObfsConfig {
 }
 
 func NewObfsState() *ObfsState {
-	var buf [14]byte // 6 байт для seq/ts + 8 байт для инициализации PRNG
+	var buf [6]byte
 	_, _ = rand.Read(buf[:])
-	
-	seed := binary.BigEndian.Uint64(buf[6:14])
-	if seed == 0 {
-		seed = 0xdeadbeef10decaf1 // сид для Xorshift не должен быть равен 0
-	}
-
 	return &ObfsState{
 		initSeq: binary.BigEndian.Uint16(buf[0:2]),
 		initTs:  binary.BigEndian.Uint32(buf[2:6]),
 		count:   0,
-		rng:     seed,
 	}
 }
 
@@ -107,28 +98,29 @@ func obfsWrapWireLen(payloadLen int, cfg *ObfsConfig) int {
 	return 12 + payloadLen + chacha20poly1305.Overhead + pad
 }
 
+func obfsMix64(v uint64) uint64 {
+	x := (v + 0x9e3779b97f4a7c15) ^ 0xbf58476d1ce4e5b9
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
 func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsConfig, state *ObfsState) (int, error) {
 	if len(payload) == 0 {
 		return 0, errors.New("obfs: empty payload")
 	}
-	
-	state.mu.Lock()
-	c := state.count
-	state.count++
-	
-	// Один шаг Xorshift64 под существующим локом
-	x := state.rng
-	x ^= x << 13
-	x ^= x >> 7
-	x ^= x << 17
-	state.rng = x
-	state.mu.Unlock()
 
+	c := atomic.AddUint64(&state.count, 1) - 1
 	seq := state.initSeq + uint16(c)
 	ts := state.initTs + uint32(c)*960 + uint32(c>>16)
 
 	padRand := 0
+	x := uint64(0)
 	if cfg.PaddingMax > 0 {
+		x = obfsMix64(c)
 		padRand = int(x % uint64(cfg.PaddingMax))
 	}
 	padTotal := padRand + 1
@@ -147,17 +139,10 @@ func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsC
 	obfsBuildNonceInto(&nonce, cfg.SSRC, seq, ts)
 	sealed := aead.Seal(dst[12:12], nonce[:], payload, dst[:12])
 	padStart := 12 + len(sealed)
-	
-	// Быстрое заполнение padding байтами из PRNG без аллокаций
+
 	if padRand > 0 {
-		localRNG := x
 		for i := 0; i < padRand; i++ {
-			if i%8 == 0 && i > 0 {
-				localRNG ^= localRNG << 13
-				localRNG ^= localRNG >> 7
-				localRNG ^= localRNG << 17
-			}
-			dst[padStart+i] = byte(localRNG >> ((i % 8) * 8))
+			dst[padStart+i] = byte(x >> ((i % 8) * 8))
 		}
 	}
 	dst[outLen-1] = byte(padTotal)
@@ -255,7 +240,7 @@ type wrapPacketConn struct {
 	inner     net.PacketConn
 	keys      *wrapKeyStore
 	key       []byte
-	aead      cipher.AEAD 
+	aead      cipher.AEAD
 	selected  int32
 	authLog   int32
 	obfsCfg   *ObfsConfig
@@ -283,7 +268,7 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			return 0, addr, err
 		}
 		if n > 0 && (buf[0] == 0x00 || buf[0] == 0x16) {
-			continue 
+			continue
 		}
 		break
 	}
@@ -309,7 +294,7 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		c.key = key
 		c.aead = aead
 		c.obfsCfg = NewObfsConfig()
-		
+
 		if len(raw) > 1 {
 			c.obfsCfg.PayloadType = raw[1] & 0x7F
 		}
