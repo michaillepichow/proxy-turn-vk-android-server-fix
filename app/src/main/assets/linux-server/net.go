@@ -441,7 +441,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 		dbMutex.Lock()
 
-		
 		isMainPass := password != "" && password == db.MainPassword
 		entry, isGenPass := db.Passwords[password]
 		valid := isMainPass || (isGenPass && !isPasswordExpired(entry))
@@ -451,7 +450,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			log.Printf("[WG] Отказ: пароль %s деактивирован, запрос от %s", maskPassword(password), deviceID)
 			dbMutex.Unlock()
 		} else if valid && isGenPass && entry.DeviceID != "" && entry.DeviceID != deviceID {
-			
 			clientConn.Write([]byte("DENIED:device_mismatch"))
 			log.Printf("[WG] Отказ: пароль %s привязан к %s, запрос от %s", maskPassword(password), entry.DeviceID, deviceID)
 			dbMutex.Unlock()
@@ -459,7 +457,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			connPassword = password
 			connIsMainPass = isMainPass
 
-			
 			if isGenPass && entry.DeviceID == "" {
 				entry.DeviceID = deviceID
 				saveDB()
@@ -519,7 +516,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		firstPacket = buf[:n]
 	}
 
-	
 	wgConn, err := net.Dial("udp", wgEndpoint)
 	if err != nil {
 		return
@@ -544,10 +540,59 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		wgConn.SetDeadline(time.Now())
 	})
 
+	// Локальные счетчики трафика для текущей сессии
+	var localUpBytes int64
+	var localDownBytes int64
+
+	// Функция сброса локальной статистики в глобальную БД
+	flushStats := func() bool {
+		// Атомарно забираем накопленные байты и сбрасываем локальные счетчики в 0
+		up := atomic.SwapInt64(&localUpBytes, 0)
+		down := atomic.SwapInt64(&localDownBytes, 0)
+
+		dbMutex.Lock()
+		defer dbMutex.Unlock()
+
+		e, ok := db.Passwords[connPassword]
+		if !ok || e == nil || isPasswordExpired(e) || e.IsDeactivated {
+			// Если пароль больше не валиден (истек/удален), сигнализируем о необходимости закрыть соединение
+			return false
+		}
+
+		e.UpBytes += up
+		e.DownBytes += down
+		return true
+	}
+
 	var proxyWg sync.WaitGroup
 	proxyWg.Add(2)
 
-	
+	// Запускаем горутину периодического сброса статистики, только если это не мастер-пароль
+	if connPassword != "" && !connIsMainPass {
+		proxyWg.Add(1)
+		go func() {
+			defer proxyWg.Done()
+			ticker := time.NewTicker(5 * time.Second) // Интервал обновления базы данных
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-pctx.Done():
+					// Перед выходом осуществляем финальный сброс оставшейся статистики
+					flushStats()
+					return
+				case <-ticker.C:
+					// Сбрасываем статистику. Если сессия невалидна, инициируем отключение
+					if !flushStats() {
+						pcancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Направление: Клиент -> WireGuard (Upload)
 	go func() {
 		defer proxyWg.Done()
 		defer pcancel()
@@ -570,23 +615,18 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 			atomic.AddInt64(&totalBytesFromClient, int64(nn))
 			
+			// Локальный атомарный инкремент без использования мьютекса
 			if connPassword != "" && !connIsMainPass {
-				dbMutex.Lock()
-				e, ok := db.Passwords[connPassword]
-				if !ok || e == nil || isPasswordExpired(e) || e.IsDeactivated {
-					dbMutex.Unlock()
-					return
-				}
-				e.UpBytes += int64(nn)
-				dbMutex.Unlock()
+				atomic.AddInt64(&localUpBytes, int64(nn))
 			}
+
 			if _, err := wgConn.Write((*b)[:nn]); err != nil {
 				return
 			}
 		}
 	}()
 
-	
+	// Направление: WireGuard -> Клиент (Download)
 	go func() {
 		defer proxyWg.Done()
 		defer pcancel()
@@ -611,16 +651,11 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 			atomic.AddInt64(&totalBytesToClient, int64(nn))
 			
+			// Локальный атомарный инкремент без использования мьютекса
 			if connPassword != "" && !connIsMainPass {
-				dbMutex.Lock()
-				e, ok := db.Passwords[connPassword]
-				if !ok || e == nil || isPasswordExpired(e) || e.IsDeactivated {
-					dbMutex.Unlock()
-					return
-				}
-				e.DownBytes += int64(nn)
-				dbMutex.Unlock()
+				atomic.AddInt64(&localDownBytes, int64(nn))
 			}
+
 			if _, err := clientConn.Write((*b)[:nn]); err != nil {
 				return
 			}
