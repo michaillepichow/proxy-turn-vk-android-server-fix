@@ -157,6 +157,22 @@ func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsC
 	return outLen, nil
 }
 
+func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]byte, error) {
+	if len(key) != wrapKeyLen {
+		return nil, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
+	}
+	aead, err := getAEAD(key)
+	if err != nil {
+		return nil, fmt.Errorf("obfs: cipher init: %w", err)
+	}
+	out := make([]byte, obfsWrapWireLen(len(payload), cfg))
+	n, err := obfsWrapPacketInto(out, aead, payload, cfg, state)
+	if err != nil {
+		return nil, err
+	}
+	return out[:n], nil
+}
+
 func obfsUnwrapPacketAEAD(aead cipher.AEAD, wire, dst []byte) (int, error) {
 	if len(wire) < 13 {
 		return 0, errors.New("obfs: packet too short")
