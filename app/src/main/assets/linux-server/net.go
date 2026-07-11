@@ -586,19 +586,29 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		}()
 	}
 
-	// Направление: Клиент -> WireGuard (Upload)
+// Направление: Клиент -> WireGuard (Upload)
 	go func() {
 		defer proxyWg.Done()
 		defer pcancel()
 		b := getBuf()
 		defer putBuf(b)
+		
+		var lastDeadlineUpdate time.Time
+
 		for {
 			select {
 			case <-pctx.Done():
 				return
 			default:
 			}
-			clientConn.SetReadDeadline(time.Now().Add(30 * time.Minute))
+			
+			// Вызываем дедлайн только раз в 15 секунд, а не на каждый пакет
+			now := time.Now()
+			if now.Sub(lastDeadlineUpdate) > 15*time.Second {
+				clientConn.SetReadDeadline(now.Add(30 * time.Minute))
+				lastDeadlineUpdate = now
+			}
+
 			nn, err := clientConn.Read(*b)
 			if err != nil {
 				return
@@ -619,19 +629,29 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		}
 	}()
 
-	// Направление: WireGuard -> Клиент (Download)
+// Направление: WireGuard -> Клиент (Download)
 	go func() {
 		defer proxyWg.Done()
 		defer pcancel()
 		b := getBuf()
 		defer putBuf(b)
+
+		var lastDeadlineUpdate time.Time
+
 		for {
 			select {
 			case <-pctx.Done():
 				return
 			default:
 			}
-			wgConn.SetReadDeadline(time.Now().Add(30 * time.Minute))
+
+			// Вызываем дедлайн только раз в 15 секунд
+			now := time.Now()
+			if now.Sub(lastDeadlineUpdate) > 15*time.Second {
+				wgConn.SetReadDeadline(now.Add(30 * time.Minute))
+				lastDeadlineUpdate = now
+			}
+
 			nn, err := wgConn.Read(*b)
 			if err != nil {
 				if isNetTimeout(err) {
