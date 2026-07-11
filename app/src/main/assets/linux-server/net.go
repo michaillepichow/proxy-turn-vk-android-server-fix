@@ -71,8 +71,11 @@ var (
 func statsLoop(ctx context.Context, configDir string) {
 	serverStartTime = time.Now()
 	statsFile := filepath.Join(configDir, "server.log")
-	ticker := time.NewTicker(10 * time.Second)
+	
+	// интервал с 10 секунд на 1 минуту, чтобы снизить нагрузку на диск и процессор 
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
+	
 	for {
 		select {
 		case <-ctx.Done():
@@ -84,13 +87,8 @@ func statsLoop(ctx context.Context, configDir string) {
 			total := atomic.LoadInt64(&totalConns)
 			uptime := time.Since(serverStartTime)
 
-			log.Printf("[СТАТ] Активных: %d | Всего: %d | NAT: %s | ↑%.2f МБ | ↓%.2f МБ",
-				active, total, natType,
-				float64(fromC)/1024/1024,
-				float64(toC)/1024/1024,
-			)
+			// log.Printf убран чтобы не засорять логи  дублирующейся информацией
 
-			
 			dbMutex.Lock()
 			numPasswords := len(db.Passwords)
 			numDevices := len(db.Devices)
