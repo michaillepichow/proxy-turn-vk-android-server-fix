@@ -1,5 +1,3 @@
-
-
 package main
 
 import (
@@ -28,6 +26,14 @@ const (
 
 var aeadCache sync.Map
 
+// Локальный пул буферов для чтения, чтобы не аллоцировать память на каждый пакет
+var obfsBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 2048)
+		return &b
+	},
+}
+
 func getAEAD(key []byte) (cipher.AEAD, error) {
 	if len(key) != wrapKeyLen {
 		return nil, fmt.Errorf("obfs: key must be %d bytes", wrapKeyLen)
@@ -55,11 +61,12 @@ type ObfsState struct {
 	initSeq uint16
 	initTs  uint32
 	count   uint64
+	rng     uint64 // Быстрый неблокирующий PRNG (Xorshift64)
 }
 
 func NewObfsConfig() *ObfsConfig {
 	var buf [4]byte
-	rand.Read(buf[:])
+	_, _ = rand.Read(buf[:])
 	return &ObfsConfig{
 		SSRC:        binary.BigEndian.Uint32(buf[:]),
 		PayloadType: 111,
@@ -68,12 +75,19 @@ func NewObfsConfig() *ObfsConfig {
 }
 
 func NewObfsState() *ObfsState {
-	var buf [6]byte
-	rand.Read(buf[:])
+	var buf [14]byte // 6 байт для seq/ts + 8 байт для инициализации PRNG
+	_, _ = rand.Read(buf[:])
+	
+	seed := binary.BigEndian.Uint64(buf[6:14])
+	if seed == 0 {
+		seed = 0xdeadbeef10decaf1 // сид для Xorshift не должен быть равен 0
+	}
+
 	return &ObfsState{
 		initSeq: binary.BigEndian.Uint16(buf[0:2]),
 		initTs:  binary.BigEndian.Uint32(buf[2:6]),
 		count:   0,
+		rng:     seed,
 	}
 }
 
@@ -83,14 +97,6 @@ func obfsBuildNonceInto(dst *[12]byte, ssrc uint32, seq uint16, ts uint32) {
 	dst[6] = 0
 	dst[7] = 0
 	binary.BigEndian.PutUint32(dst[8:12], ts)
-}
-
-func obfsBuildNonce(ssrc uint32, seq uint16, ts uint32) []byte {
-	n := make([]byte, 12)
-	var tmp [12]byte
-	obfsBuildNonceInto(&tmp, ssrc, seq, ts)
-	copy(n, tmp[:])
-	return n
 }
 
 func obfsWrapWireLen(payloadLen int, cfg *ObfsConfig) int {
@@ -105,9 +111,17 @@ func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsC
 	if len(payload) == 0 {
 		return 0, errors.New("obfs: empty payload")
 	}
+	
 	state.mu.Lock()
 	c := state.count
 	state.count++
+	
+	// Один шаг Xorshift64 под существующим локом
+	x := state.rng
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	state.rng = x
 	state.mu.Unlock()
 
 	seq := state.initSeq + uint16(c)
@@ -115,9 +129,7 @@ func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsC
 
 	padRand := 0
 	if cfg.PaddingMax > 0 {
-		var rndBuf [1]byte
-		rand.Read(rndBuf[:])
-		padRand = int(rndBuf[0]) % cfg.PaddingMax
+		padRand = int(x % uint64(cfg.PaddingMax))
 	}
 	padTotal := padRand + 1
 	outLen := 12 + len(payload) + chacha20poly1305.Overhead + padTotal
@@ -135,27 +147,21 @@ func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsC
 	obfsBuildNonceInto(&nonce, cfg.SSRC, seq, ts)
 	sealed := aead.Seal(dst[12:12], nonce[:], payload, dst[:12])
 	padStart := 12 + len(sealed)
+	
+	// Быстрое заполнение padding байтами из PRNG без аллокаций
 	if padRand > 0 {
-		rand.Read(dst[padStart : padStart+padRand])
+		localRNG := x
+		for i := 0; i < padRand; i++ {
+			if i%8 == 0 && i > 0 {
+				localRNG ^= localRNG << 13
+				localRNG ^= localRNG >> 7
+				localRNG ^= localRNG << 17
+			}
+			dst[padStart+i] = byte(localRNG >> ((i % 8) * 8))
+		}
 	}
 	dst[outLen-1] = byte(padTotal)
 	return outLen, nil
-}
-
-func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]byte, error) {
-	if len(key) != wrapKeyLen {
-		return nil, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
-	}
-	aead, err := getAEAD(key)
-	if err != nil {
-		return nil, fmt.Errorf("obfs: cipher init: %w", err)
-	}
-	out := make([]byte, obfsWrapWireLen(len(payload), cfg))
-	n, err := obfsWrapPacketInto(out, aead, payload, cfg, state)
-	if err != nil {
-		return nil, err
-	}
-	return out[:n], nil
 }
 
 func obfsUnwrapPacketAEAD(aead cipher.AEAD, wire, dst []byte) (int, error) {
@@ -255,45 +261,38 @@ type wrapPacketConn struct {
 	obfsCfg   *ObfsConfig
 	obfsWrite *ObfsState
 
-	
-	
-	
-	
 	rxMu  sync.Mutex
-	rxBuf []byte
 	txMu  sync.Mutex
 	txBuf []byte
 }
 
 func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	c.rxMu.Lock()
-	defer c.rxMu.Unlock()
-
-	
-	need := len(p) + 80
-	if cap(c.rxBuf) < need {
-		c.rxBuf = make([]byte, need)
-	}
-	buf := c.rxBuf[:need]
+	// Получаем буфер из пула во временное пользование (вне мьютекса!)
+	bufPtr := obfsBufPool.Get().(*[]byte)
+	defer obfsBufPool.Put(bufPtr)
+	buf := *bufPtr
 
 	var n int
 	var addr net.Addr
 	var err error
-	var raw []byte
 
+	// Сетевое чтение происходит без блокировки rxMu
 	for {
 		n, addr, err = c.inner.ReadFrom(buf)
 		if err != nil {
 			return 0, addr, err
 		}
-		raw = buf[:n]
-
-		
-		if len(raw) > 0 && (raw[0] == 0x00 || raw[0] == 0x16) {
+		if n > 0 && (buf[0] == 0x00 || buf[0] == 0x16) {
 			continue 
 		}
 		break
 	}
+
+	raw := buf[:n]
+
+	// Блокируем только на короткие вычисления
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
 
 	if atomic.LoadInt32(&c.selected) == 0 {
 		key, m, uErr := c.keys.Unwrap(raw, p)
