@@ -1,0 +1,40 @@
+name: Build & Release Server Binary
+
+on:
+  push:
+    tags:
+      - 'v*' # Запускается автоматически при пуше тега, например: v1.0.0, v3.2
+  workflow_dispatch: # Позволяет запускать сборку вручную из вкладки Actions
+
+permissions:
+  contents: write # Права для создания Релиза и загрузки файлов
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # При необходимости укажите вашу версию Go или 'stable'
+
+      - name: Build Linux AMD64 binary
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          cd app/src/main/assets/linux-server
+          # Собираем бинарник под именем wdtt-server прямо в корень рабочей области
+          go build -ldflags="-s -w" -o "$GITHUB_WORKSPACE/wdtt-server" .
+
+      - name: Publish Binary to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wdtt-server
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
