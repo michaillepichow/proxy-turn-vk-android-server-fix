@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -10,8 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"crypto/cipher"
 
 	"golang.org/x/crypto/chacha20poly1305"
 
@@ -24,7 +23,10 @@ const (
 	wrapKeyLen   = 32
 )
 
-var aeadCache sync.Map
+var (
+	aeadCacheMu sync.RWMutex
+	aeadCache   = make(map[string]cipher.AEAD)
+)
 
 // Локальный пул буферов для чтения, чтобы не аллоцировать память на каждый пакет
 var obfsBufPool = sync.Pool{
@@ -39,14 +41,22 @@ func getAEAD(key []byte) (cipher.AEAD, error) {
 		return nil, fmt.Errorf("obfs: key must be %d bytes", wrapKeyLen)
 	}
 	keyStr := string(key)
-	if val, ok := aeadCache.Load(keyStr); ok {
-		return val.(cipher.AEAD), nil
+
+	aeadCacheMu.RLock()
+	if aead, ok := aeadCache[keyStr]; ok {
+		aeadCacheMu.RUnlock()
+		return aead, nil
 	}
+	aeadCacheMu.RUnlock()
+
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
 		return nil, err
 	}
-	aeadCache.Store(keyStr, aead)
+
+	aeadCacheMu.Lock()
+	aeadCache[keyStr] = aead
+	aeadCacheMu.Unlock()
 	return aead, nil
 }
 
