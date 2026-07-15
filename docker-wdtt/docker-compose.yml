@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  wdtt:
+    build: .
+    container_name: wdtt-vpn
+    restart: always
+    init: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: ${WDTT_NETWORK_MODE:-host}
+    environment:
+      - WDTT_DTLS_PORT=${WDTT_DTLS_PORT:-56000}
+      - WDTT_WG_PORT=${WDTT_WG_PORT:-56001}
+      - WDTT_ARGS=${WDTT_ARGS:-}
+      - WDTT_CLIENT_CIDR=${WDTT_CLIENT_CIDR:-10.66.66.0/24}
+      - WDTT_ENABLE_TCPMSS=${WDTT_ENABLE_TCPMSS:-0}
+    volumes:
+      - ./config:/etc/wdtt
