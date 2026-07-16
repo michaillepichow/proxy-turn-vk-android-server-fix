@@ -79,7 +79,7 @@ cd docker-wdtt
    WDTT_WG_PORT=56001
    WDTT_CLIENT_CIDR=10.66.66.0/24
    WDTT_ENABLE_TCPMSS=1
-   WDTT_ARGS="-password 'ВашПароль' -bot-token '123:ABC' -admin '98765'"
+   WDTT_ARGS="-password ВашПароль -bot-token 123:ABC -admin 98765"
    ```
 2. Запустите сборку и старт одной командой:
    ```bash
